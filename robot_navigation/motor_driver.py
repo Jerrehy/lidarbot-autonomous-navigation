@@ -1,7 +1,16 @@
+#!/usr/bin/env python3
+"""
+Драйвер моторов с реальной одометрией и TF
+"""
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
+from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
 import subprocess
+import math
+import time
+
 
 class MotorDriver(Node):
     def __init__(self):
@@ -34,7 +43,37 @@ class MotorDriver(Node):
         self.max_speed = self.get_parameter('max_speed').value
 
         # Инициализация GPIO
-        self.get_logger().info('Initializing GPIO...')
+        self._init_gpio()
+
+        # Подписка на cmd_vel
+        self.subscription = self.create_subscription(
+            Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+
+        # Публикация одометрии
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+        # Состояние одометрии
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.last_time = self.get_clock().now()
+
+        # Текущие скорости
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+
+        # Таймер публикации одометрии (20 Hz)
+        self.odom_timer = self.create_timer(0.05, self.publish_odom)
+
+        # Watchdog
+        self.last_cmd_time = self.get_clock().now()
+        self.watchdog_timer = self.create_timer(0.1, self.safety_watchdog)
+        self.watchdog_triggered = False
+
+        self.get_logger().info('✅ Motor Driver готов')
+
+    def _init_gpio(self):
         try:
             subprocess.run(['gpio', '-g', 'pwm-ms'], check=True)
             subprocess.run(['gpio', '-g', 'pwmr', '1024'], check=True)
@@ -44,40 +83,17 @@ class MotorDriver(Node):
                     subprocess.run(['gpio', '-g', 'mode', str(pin), 'pwm'], check=True)
                 else:
                     subprocess.run(['gpio', '-g', 'mode', str(pin), 'out'], check=True)
-            self.get_logger().info('GPIO initialized successfully.')
+            self.get_logger().info('GPIO инициализирован')
         except subprocess.CalledProcessError as e:
             self.get_logger().error(f'GPIO init failed: {e}')
 
-        # Подписка на cmd_vel
-        self.subscription = self.create_subscription(
-            Twist, 'cmd_vel', self.cmd_vel_callback, 10)
-
-        # Watchdog
-        self.last_cmd_time = self.get_clock().now()
-        self.watchdog_timer = self.create_timer(0.1, self.safety_watchdog)
-        self.watchdog_timeout = 0.5
-        self.watchdog_triggered = False
-
-        # Публикация одометрии (для уровня 3 — заглушка)
-        from nav_msgs.msg import Odometry
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-        self.odom_timer = self.create_timer(0.05, self.publish_dummy_odom)
-
-        self.get_logger().info('Motor Driver Node is ready.')
-
     def cmd_vel_callback(self, msg: Twist):
         self.last_cmd_time = self.get_clock().now()
+        self.current_linear = msg.linear.x
+        self.current_angular = msg.angular.z
 
-        if self.watchdog_triggered:
-            self.get_logger().info('Connection restored.')
-            self.watchdog_triggered = False
-
-        linear_x = msg.linear.x
-        angular_z = msg.angular.z
-
-        # Дифференциальный привод
-        v_left = linear_x - (angular_z * self.wheel_base / 2.0)
-        v_right = linear_x + (angular_z * self.wheel_base / 2.0)
+        v_left = self.current_linear - (self.current_angular * self.wheel_base / 2.0)
+        v_right = self.current_linear + (self.current_angular * self.wheel_base / 2.0)
 
         v_left = max(-self.max_speed, min(self.max_speed, v_left))
         v_right = max(-self.max_speed, min(self.max_speed, v_right))
@@ -95,7 +111,6 @@ class MotorDriver(Node):
         else:
             fwd_pin, bwd_pin, pwm_pin = self.pins['rf'], self.pins['rb'], self.pins['rp']
 
-        # Направление
         if speed > 0.01:
             subprocess.run(['gpio', '-g', 'write', str(fwd_pin), '1'])
             subprocess.run(['gpio', '-g', 'write', str(bwd_pin), '0'])
@@ -106,34 +121,63 @@ class MotorDriver(Node):
             subprocess.run(['gpio', '-g', 'write', str(fwd_pin), '0'])
             subprocess.run(['gpio', '-g', 'write', str(bwd_pin), '0'])
 
-        # !!! ИСПРАВЛЕНИЕ: отправляем реальный PWM, а не 0 !!!
         subprocess.run(['gpio', '-g', 'pwm', str(pwm_pin), str(abs_pwm)])
 
-    def publish_dummy_odom(self):
-        """Заглушка одометрии для уровня 3"""
-        from nav_msgs.msg import Odometry
-        msg = Odometry()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'odom'
-        msg.child_frame_id = 'base_link'
-        self.odom_pub.publish(msg)
+    def publish_odom(self):
+        """Интегрирование одометрии и публикация TF"""
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds / 1e9
+        self.last_time = current_time
+
+        # Интегрирование (простая модель без энкодеров)
+        self.x += self.current_linear * math.cos(self.theta) * dt
+        self.y += self.current_linear * math.sin(self.theta) * dt
+        self.theta += self.current_angular * dt
+
+        # Кватернион
+        q_z = math.sin(self.theta / 2)
+        q_w = math.cos(self.theta / 2)
+
+        # Публикация TF: odom -> base_link
+        t = TransformStamped()
+        t.header.stamp = current_time.to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_link'
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+        t.transform.rotation.z = q_z
+        t.transform.rotation.w = q_w
+        self.tf_broadcaster.sendTransform(t)
+
+        # Публикация Odometry
+        odom = Odometry()
+        odom.header.stamp = current_time.to_msg()
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'base_link'
+        odom.pose.pose.position.x = self.x
+        odom.pose.pose.position.y = self.y
+        odom.pose.pose.orientation.z = q_z
+        odom.pose.pose.orientation.w = q_w
+        odom.twist.twist.linear.x = self.current_linear
+        odom.twist.twist.angular.z = self.current_angular
+        self.odom_pub.publish(odom)
 
     def safety_watchdog(self):
         now = self.get_clock().now()
         dt = (now - self.last_cmd_time).nanoseconds / 1e9
-        if dt > self.watchdog_timeout:
+        if dt > 0.5:
             if not self.watchdog_triggered:
-                self.get_logger().warn('Watchdog: stopping motors.')
+                self.get_logger().warn('⚠️ Watchdog: остановка моторов')
                 self.watchdog_triggered = True
-            self.stop_motors()
-
-    def stop_motors(self):
-        self.set_motor('left', 0.0, 0)
-        self.set_motor('right', 0.0, 0)
+            self.set_motor('left', 0.0, 0)
+            self.set_motor('right', 0.0, 0)
+            self.current_linear = 0.0
+            self.current_angular = 0.0
 
     def destroy_node(self):
-        self.get_logger().info('Shutting down. Stopping motors...')
-        self.stop_motors()
+        self.set_motor('left', 0.0, 0)
+        self.set_motor('right', 0.0, 0)
         super().destroy_node()
 
 
