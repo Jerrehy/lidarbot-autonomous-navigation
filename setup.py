@@ -36,6 +36,7 @@ setup(
             'explorer = robot_navigation.explorer:main',
             'web_monitor = robot_navigation.web_monitor:main',
             'dynamic_obstacle_detector = robot_navigation.dynamic_obstacle_detector:main',
+            'initial_pose_setter = robot_navigation.initial_pose_setter:main',
         ],
     },
 )
